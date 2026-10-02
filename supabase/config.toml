@@ -20,9 +20,6 @@ major_version = 17
 enabled = true
 port = 54323
 
-[inbucket]
-enabled = false
-
 [storage]
 enabled = false
 
