@@ -31,6 +31,20 @@ create function pg_temp.stock(p text) returns numeric language sql as $$
 create function pg_temp.lote(p text) returns numeric language sql as $$
   select (e ->> 'cantidadRestante')::numeric from app_data, jsonb_array_elements(value) e
   where key = 'lotes' and e ->> 'id' = p $$;
+-- Llama a la función y, si lanza un error, lo devuelve como {"error": ...} en vez
+-- de abortar el archivo: así cada falla aparece como una aserción concreta.
+create function pg_temp.vender(p_venta jsonb, p_offline boolean) returns jsonb language plpgsql as $$
+begin
+  return registrar_venta(p_venta, p_offline);
+exception when others then
+  return jsonb_build_object('error', sqlerrm);
+end $$;
+create function pg_temp.salida(p_mov jsonb) returns jsonb language plpgsql as $$
+begin
+  return registrar_salida_stock(p_mov);
+exception when others then
+  return jsonb_build_object('error', sqlerrm);
+end $$;
 create function pg_temp.venta(p_id text, p_prod text, p_cant numeric, p_metodo text default 'efectivo')
 returns jsonb language sql as $$
   select jsonb_build_object('id', p_id, 'operador', 'Prueba', 'fecha', 1790900000000,
@@ -43,32 +57,32 @@ set local role authenticated;
 set local request.jwt.claims = '{"role":"authenticated","app_metadata":{"usuario_id":"tvend"}}';
 do $$
 begin
-  insert into r values ('normal',      registrar_venta(pg_temp.venta('venta-0001', 'p1', 2), false));
+  insert into r values ('normal',      pg_temp.vender(pg_temp.venta('venta-0001', 'p1', 2), false));
   insert into r values ('stock_1',     to_jsonb(pg_temp.stock('p1')));
-  insert into r values ('repetida',    registrar_venta(pg_temp.venta('venta-0001', 'p1', 2), false));
+  insert into r values ('repetida',    pg_temp.vender(pg_temp.venta('venta-0001', 'p1', 2), false));
   insert into r values ('stock_2',     to_jsonb(pg_temp.stock('p1')));
-  insert into r values ('agrupada',    registrar_venta(
+  insert into r values ('agrupada',    pg_temp.vender(
     '{"id":"venta-0002","pagos":[{"metodo":"efectivo","monto":4000}],
       "items":[{"productoId":"p1","cantidad":2,"precioUnitario":1000},
                {"productoId":"p1","cantidad":2,"precioUnitario":1000}]}', false));
   insert into r values ('stock_3',     to_jsonb(pg_temp.stock('p1')));
-  insert into r values ('negativa',    registrar_venta(pg_temp.venta('venta-0003', 'p1', -5), false));
-  insert into r values ('sin_stock',   registrar_venta(pg_temp.venta('venta-0004', 'p1', 50), false));
+  insert into r values ('negativa',    pg_temp.vender(pg_temp.venta('venta-0003', 'p1', -5), false));
+  insert into r values ('sin_stock',   pg_temp.vender(pg_temp.venta('venta-0004', 'p1', 50), false));
   insert into r values ('stock_4',     to_jsonb(pg_temp.stock('p1')));
-  insert into r values ('offline',     registrar_venta(pg_temp.venta('venta-0005', 'p1', 50), true));
+  insert into r values ('offline',     pg_temp.vender(pg_temp.venta('venta-0005', 'p1', 50), true));
   insert into r values ('stock_5',     to_jsonb(pg_temp.stock('p1')));
-  insert into r values ('vend_fiado',  registrar_venta(pg_temp.venta('venta-0006', 'p2', 1, 'fiado') || '{"clienteId":"c1"}', false));
-  insert into r values ('vend_merma',  registrar_salida_stock('{"id":"merma-0001","productoId":"p2","cantidad":1,"tipo":"salida"}'));
+  insert into r values ('vend_fiado',  pg_temp.vender(pg_temp.venta('venta-0006', 'p2', 1, 'fiado') || '{"clienteId":"c1"}', false));
+  insert into r values ('vend_merma',  pg_temp.salida('{"id":"merma-0001","productoId":"p2","cantidad":1,"tipo":"salida"}'));
 end $$;
 
 -- ---- como administradora -----------------------------------------------------
 set local request.jwt.claims = '{"role":"authenticated","app_metadata":{"usuario_id":"tadmin"}}';
 do $$
 begin
-  insert into r values ('fiado',       registrar_venta(pg_temp.venta('venta-0007', 'p2', 1, 'fiado') || '{"clienteId":"c1"}', false));
-  insert into r values ('fiado_malo',  registrar_venta(pg_temp.venta('venta-0008', 'p2', 1, 'fiado') || '{"clienteId":"no-existe"}', false));
-  insert into r values ('merma',       registrar_salida_stock('{"id":"merma-0002","productoId":"p2","cantidad":2,"tipo":"salida"}'));
-  insert into r values ('merma_rep',   registrar_salida_stock('{"id":"merma-0002","productoId":"p2","cantidad":2,"tipo":"salida"}'));
+  insert into r values ('fiado',       pg_temp.vender(pg_temp.venta('venta-0007', 'p2', 1, 'fiado') || '{"clienteId":"c1"}', false));
+  insert into r values ('fiado_malo',  pg_temp.vender(pg_temp.venta('venta-0008', 'p2', 1, 'fiado') || '{"clienteId":"no-existe"}', false));
+  insert into r values ('merma',       pg_temp.salida('{"id":"merma-0002","productoId":"p2","cantidad":2,"tipo":"salida"}'));
+  insert into r values ('merma_rep',   pg_temp.salida('{"id":"merma-0002","productoId":"p2","cantidad":2,"tipo":"salida"}'));
 end $$;
 reset role;
 
