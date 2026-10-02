@@ -27,12 +27,12 @@ jobs:
 
       - name: Concurrencia real (conexiones en paralelo)
         run: |
-          eval "$(supabase status -o env)"
+          set -a; eval "$(supabase status -o env)"; set +a
           DATABASE_URL="$DB_URL" tests/concurrencia.sh
 
       - name: Integración HTTP (login, sesión y ventas por la API)
         run: |
-          eval "$(supabase status -o env)"
+          set -a; eval "$(supabase status -o env)"; set +a
           supabase functions serve > functions.log 2>&1 &
           for i in $(seq 1 60); do
             codigo=$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS "$API_URL/functions/v1/iniciar-sesion" || true)
