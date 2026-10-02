@@ -42,7 +42,7 @@
 --      clave nueva viajan juntas a fn_restablecer_clave, que solo puede ejecutar
 --      la Edge Function. Ya no existe un "guardar clave" sin autenticar.
 --
--- QUÉ NO CAMBIA (a propósito, ver README "Problemas abiertos"):
+-- QUÉ NO CAMBIA (se resuelve en la migración 010, registrar_venta):
 --   la concurrencia de vender_stock / sincronización offline.
 -- ============================================================================
 

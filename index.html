@@ -549,7 +549,7 @@ const fmtDate = (ts) => {
   return d.toLocaleDateString('es-CL',{day:'2-digit',month:'2-digit'}) + ' ' + d.toLocaleTimeString('es-CL',{hour:'2-digit',minute:'2-digit'});
 };
 const escapeHtml = (s) => (s==null?'':String(s)).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const bajoStock = (p) => Number(p.stock||0) <= Number(p.stockMinimo||0);
+const bajoStock = (p) => stockDe(p) <= Number(p.stockMinimo||0);
 
 /* ---------------- PERSISTENCIA Y SINCRONIZACIÓN ---------------- */
 /* Todo dato compartido vive en tres lugares:
@@ -664,7 +664,7 @@ function limpiarPendiente(key){
 function actualizarIndicadorSync(){
   const el = document.getElementById('sync-ind');
   if(!el) return;
-  const n = listaPendientes().length;
+  const n = listaPendientes().length + colaVentas.length;
   el.textContent = n ? '⏳ sin subir' : '';
   el.title = n ? 'Hay cambios guardados solo en este dispositivo. Se suben solos al volver la conexión.' : '';
 }
@@ -738,13 +738,8 @@ function fusionar(key, remoto, local){
     // lo que yo tenía sincronizado y ya no está en mi copia, lo borré yo: se respeta el borrado
     snap.forEach((_, id)=>{ if(!idsLocales.has(id)) porId.delete(id); });
   }
-  /* Si dos cajas descontaron la misma unidad a la vez, la suma de ambos descuentos
-     puede dejar el stock en negativo, y aquí se deja en 0. El registro de lo vendido
-     sigue intacto en "movimientos", pero el inventario esconde la sobreventa en vez de
-     mostrarla: es uno de los problemas abiertos del README. */
-  if(key==='productos'){
-    porId.forEach(p=>{ if(p && Number(p.stock) < 0) p.stock = 0; });
-  }
+  /* Un stock negativo NO se corrige a 0: si aparece, es una venta hecha sin conexión que
+     vendió más de lo que había, y tiene que verse para revisarla. */
   return Array.from(porId.values());
 }
 function aplicarFusion(key, datos){
@@ -852,7 +847,7 @@ let sincronizando = false;
 async function reintentarSync(silencioso){
   if(sincronizando) return;
   const claves = listaPendientes();
-  if(!claves.length) return;
+  if(!claves.length && !colaVentas.length) return;
   sincronizando = true;
   try{
     if(!db){ await conectarSupabase(); }
@@ -860,7 +855,7 @@ async function reintentarSync(silencioso){
     // sin sesión de nube (se entró sin internet) la base rechaza todo: lo pendiente
     // espera a que la persona vuelva a entrar con internet
     if(!(await usuarioSesionNube())) return;
-    let subidas = 0;
+    let subidas = await procesarColaVentas();
     for(const key of claves){
       if(tablasHistorialDisponibles && (key==='ventas' || key==='movimientos')){
         if(key==='ventas') await saveVentas(); else await saveMovimientos();
@@ -930,7 +925,7 @@ async function saveVentas(){
   if(tablasHistorialDisponibles){
     let todoOk = true;
     for(const v of ventas){
-      if(idsVentasSincronizadas.has(v.id)) continue;
+      if(idsVentasSincronizadas.has(v.id) || v._pendiente) continue; // las ventas las registra registrar_venta
       const ok = await insertarFilaHistorial('ventas_registro', v, v.fecha);
       if(ok) idsVentasSincronizadas.add(v.id); else todoOk = false;
     }
@@ -1229,14 +1224,15 @@ function metodoLabel(m){
 }
 
 /* ---------------- COSTOS FIFO ---------------- */
-function consumirFIFO(productoId, cantidad, precioFallback){
+// simular = true: calcula el costo sin tocar los lotes (para estimaciones)
+function consumirFIFO(productoId, cantidad, precioFallback, simular){
   const lotesProducto = lotes.filter(l=>l.productoId===productoId && Number(l.cantidadRestante||0)>0).sort((a,b)=>a.fecha-b.fecha);
   let restante = cantidad;
   let costoTotal = 0;
   for(const l of lotesProducto){
     if(restante<=0) break;
     const tomar = Math.min(Number(l.cantidadRestante||0), restante);
-    l.cantidadRestante = Number(l.cantidadRestante||0) - tomar;
+    if(!simular) l.cantidadRestante = Number(l.cantidadRestante||0) - tomar;
     costoTotal += tomar * Number(l.costoUnitario||0);
     restante -= tomar;
   }
@@ -1318,6 +1314,9 @@ async function initData(){
   }
   productos = p; proveedores = pr; operador = op || '';
   productosPadre = pp; lotes = lt; turnos = tu; retiros = re; clientes = cl;
+  // ventas que todavía esperan confirmación del servidor (se muestran y cuentan en la caja)
+  cargarCola();
+  colaVentas.forEach(e=>{ if(!ventas.some(v=>v.id===e.venta.id)) ventas.push(ventaPendienteLocal(e.venta)); });
 
   usuarios = Array.isArray(us) ? us : [];
   if(!usuarios.length){
@@ -1736,7 +1735,7 @@ async function entrarComo(u, conSesionNueva){
   view = u.rol === 'admin' ? 'dashboard' : 'ventas';
   if(conSesionNueva){
     await initData();
-    if(listaPendientes().length) reintentarSync(true);
+    if(listaPendientes().length || colaVentas.length) reintentarSync(true);
   } else {
     render();
   }
@@ -2028,7 +2027,7 @@ function openAjustesModal(){
   $('#m-close').addEventListener('click', closeModal);
   $('#aj-mi-acceso').addEventListener('click', ()=>{ closeModal(); openMiCuentaModal(); });
   $('#aj-sync').addEventListener('click', async ()=>{
-    if(!listaPendientes().length){ showToast(dbEstado==='ok'? 'No hay nada pendiente por subir.' : 'Sin conexión con la nube por ahora.'); return; }
+    if(!listaPendientes().length && !colaVentas.length){ showToast(dbEstado==='ok'? 'No hay nada pendiente por subir.' : 'Sin conexión con la nube por ahora.'); return; }
     await reintentarSync(false);
     closeModal();
   });
@@ -2345,7 +2344,7 @@ function renderView(){
 function renderDashboard(){
   const esAdmin = esAdminActual();
   const totalProductos = productos.length;
-  const unidades = productos.reduce((a,p)=>a+Number(p.stock||0),0);
+  const unidades = productos.reduce((a,p)=>a+stockDe(p),0);
   const valorInventario = valorInventarioCosto();
   const bajos = productos.filter(p=>bajoStock(p));
   const ventasReales = ventas.filter(v=>v.tipo!=='abono');
@@ -2376,7 +2375,7 @@ function renderDashboard(){
     ${bajos.slice(0,6).map(p=>`
       <div class="list-item">
         <div class="li-main"><div class="li-title">${escapeHtml(p.nombre)}</div><div class="li-sub">${escapeHtml(p.sku)}</div></div>
-        <div class="li-right">${p.stock} / min ${p.stockMinimo}</div>
+        <div class="li-right">${stockDe(p)} / min ${p.stockMinimo}</div>
       </div>`).join('')}
     ` : ''}
 
@@ -2458,7 +2457,7 @@ function renderProductoRow(p, opciones){
         <div class="li-sub">${escapeHtml(p.sku)}${p.categoria? ' · '+escapeHtml(p.categoria):''}${p.ubicacion? ' · '+escapeHtml(p.ubicacion):''}</div>
       </div>
       <div class="li-right">
-        <div style="font-weight:600;${bajo?'color:var(--red);':''}">${p.stock}</div>
+        <div style="font-weight:600;${bajo?'color:var(--red);':''}">${stockDe(p)}</div>
         <div style="font-size:11px;color:var(--ink-soft);">${fmtCLP(p.precio)}</div>
         ${esAdmin ? `<div class="row" style="margin-top:8px;">
           <button class="btn btn-tap" data-adj="${p.id}" data-dir="-1">−</button>
@@ -2492,7 +2491,7 @@ function renderInvResults(){
   Object.keys(grupos).forEach(padreId=>{
     const padre = productosPadre.find(x=>x.id===padreId);
     const variantes = grupos[padreId];
-    const stockTotal = variantes.reduce((a,v)=>a+Number(v.stock||0),0);
+    const stockTotal = variantes.reduce((a,v)=>a+stockDe(v),0);
     const hayBajo = variantes.some(v=>bajoStock(v));
     html += `<div class="list-item">
       <div class="li-main">
@@ -2793,7 +2792,7 @@ function openAjusteModal(p, dir){
   if(!esAdminActual()){ showToast('Solo un admin puede ajustar el stock.', 'error'); return; }
   openModal(`
     <div class="spread"><h3>Ajustar stock</h3><button class="btn btn-icon btn-ghost" id="m-close" aria-label="Cerrar">${ICONS.close}</button></div>
-    <div class="sub">${escapeHtml(p.nombre)}${p.variante? ' · '+escapeHtml(p.variante):''} · stock actual: <b>${p.stock}</b></div>
+    <div class="sub">${escapeHtml(p.nombre)}${p.variante? ' · '+escapeHtml(p.variante):''} · stock actual: <b>${stockDe(p)}</b></div>
     <label class="field">Tipo de movimiento</label>
     <select class="input" id="a-tipo">
       <option value="entrada" ${dir>0?'selected':''}>Entrada (compra / reposición)</option>
@@ -2817,23 +2816,33 @@ function openAjusteModal(p, dir){
   $('#m-close').addEventListener('click', closeModal);
   $('#a-menos').addEventListener('click', ()=>{ const i=$('#a-cant'); i.value = Math.max(1, Number(i.value)-1); });
   $('#a-mas').addEventListener('click', ()=>{ const i=$('#a-cant'); i.value = Number(i.value)+1; });
-  $('#a-guardar').addEventListener('click', ()=>{
+  $('#a-guardar').addEventListener('click', async ()=>{
     const tipo = $('#a-tipo').value;
     const cant = Math.max(1, Number($('#a-cant').value)||1);
     const signo = (tipo==='entrada') ? 1 : (tipo==='ajuste' ? (dir>=0?1:-1) : -1);
-    p.stock = Number(p.stock||0) + signo*cant;
-    let costoTotalMov;
-    if(signo > 0){
-      const costo = Number($('#a-costo').value)||0;
-      lotes.push({id:uid(), productoId:p.id, cantidadInicial:cant, cantidadRestante:cant, costoUnitario:costo, fecha:Date.now()});
-      costoTotalMov = cant*costo;
-    } else {
-      costoTotalMov = consumirFIFO(p.id, cant, p.precio);
+    const motivo = $('#a-motivo').value.trim();
+    if(signo < 0){
+      // una salida consume lotes FIFO: la registra el servidor, con el mismo bloqueo que las ventas
+      const btn = $('#a-guardar');
+      if(btn){ btn.disabled = true; btn.textContent = 'Guardando...'; }
+      const r = await registrarSalidaServidor({ id:uid(), productoId:p.id, tipo, cantidad:cant, motivo, operador, fecha:Date.now() });
+      if(!r.ok){
+        if(btn){ btn.disabled = false; btn.textContent = 'Confirmar'; }
+        showToast(r.mensaje || 'No se pudo registrar la salida.', 'error');
+        return;
+      }
+      closeModal(); render();
+      showToast('Stock actualizado: ' + stockDe(productos.find(x=>x.id===p.id)) + ' unidades.');
+      return;
     }
+    // una entrada suma un lote nuevo; sumar una diferencia es compatible con lo que haga el servidor
+    const costo = Number($('#a-costo').value)||0;
+    p.stock = Number(p.stock||0) + cant;
+    lotes.push({id:uid(), productoId:p.id, cantidadInicial:cant, cantidadRestante:cant, costoUnitario:costo, fecha:Date.now()});
     saveLotes();
-    movimientos.push({id:uid(), productoId:p.id, tipo, cantidad: signo*cant, motivo:$('#a-motivo').value.trim(), operador, fecha:Date.now(), costoTotal:costoTotalMov});
+    movimientos.push({id:uid(), productoId:p.id, tipo, cantidad:cant, motivo, operador, fecha:Date.now(), costoTotal:cant*costo});
     saveProductos(); saveMovimientos(); closeModal(); render();
-    showToast('Stock actualizado: ' + p.stock + ' unidades.');
+    showToast('Stock actualizado: ' + stockDe(p) + ' unidades.');
   });
 }
 
@@ -2949,7 +2958,7 @@ function renderBarraVentaSticky(total){
    (negocio nuevo, o pocos productos distintos vendidos), se completa con productos al azar
    entre los que tienen stock. */
 function productosMenuRapido(){
-  const disponibles = productos.filter(p=>Number(p.stock||0) > 0);
+  const disponibles = productos.filter(p=>stockDe(p) > 0);
   if(!disponibles.length) return [];
   const cantidadVendida = {};
   ventas.forEach(v=>{ if(v.tipo==='abono') return; (v.items||[]).forEach(it=>{
@@ -3093,6 +3102,8 @@ function ventaDetalleModalHtml(v){
   return `
     <div class="spread"><h3>${v.tipo==='abono'?'Detalle del abono':'Detalle de la venta'}</h3><button class="btn btn-icon btn-ghost" id="m-close" aria-label="Cerrar">${ICONS.close}</button></div>
     <p class="sub">${fmtDate(v.fecha)}${v.operador? ' · '+escapeHtml(v.operador):''}${v.cliente? ' · '+escapeHtml(v.cliente):''}</p>
+    ${v._pendiente ? '<p style="font-size:12px;color:var(--amber);margin:4px 0 0;">Guardada en este dispositivo: falta confirmarla con la nube.</p>' : ''}
+    ${v.revision ? '<p style="font-size:12px;color:var(--red);margin:4px 0 0;">Hecha sin conexión con stock insuficiente: revisa el inventario.</p>' : ''}
     <div style="border-top:1px dashed var(--line);border-bottom:1px dashed var(--line);padding:4px 0;margin:10px 0;">${itemsHtml}</div>
     <div class="spread" style="font-weight:800;font-size:16px;padding:2px 0 12px;"><span>Total</span><span>${fmtCLP(v.total)}</span></div>
     <label class="field">Forma de pago</label>
@@ -3229,7 +3240,7 @@ function renderCarrito(){
   `;
 }
 function agregarAlCarrito(p){
-  if(Number(p.stock||0) <= 0){ showToast('Ese producto no tiene stock disponible.', 'error'); return; }
+  if(stockDe(p) <= 0){ showToast('Ese producto no tiene stock disponible.', 'error'); return; }
   const existing = carrito.find(c=>c.productoId===p.id);
   if(existing) existing.cantidad += 1;
   else carrito.push({productoId:p.id, nombre:p.nombre, precio:p.precio, cantidad:1});
@@ -3432,7 +3443,7 @@ function wireVentas(){
     const matches = productos.filter(p=>(p.nombre||'').toLowerCase().includes(t) || (p.sku||'').toLowerCase().includes(t)).slice(0,6);
     box.innerHTML = matches.map(p=>`
       <div class="list-item" data-pick="${p.id}" style="cursor:pointer;">
-        <div class="li-main"><div class="li-title">${escapeHtml(p.nombre)}</div><div class="li-sub">${escapeHtml(p.sku)} · stock ${p.stock}</div></div>
+        <div class="li-main"><div class="li-title">${escapeHtml(p.nombre)}</div><div class="li-sub">${escapeHtml(p.sku)} · stock ${stockDe(p)}</div></div>
         <div class="li-right">${fmtCLP(p.precio)}</div>
       </div>`).join('') || `<div class="empty-state"><p>Sin coincidencias.</p></div>`;
   });
@@ -3609,87 +3620,161 @@ function mostrarResultadoCierre(turno, contado, debitoContado, creditoContado){
   });
 }
 let confirmandoVenta = false;
-/* Pre-chequeo de stock antes de vender:
-   antes solo se comprobaba el stock contra la copia que el navegador tenía en memoria,
-   que puede estar desactualizada si otra caja vendió el mismo producto segundos antes.
-   Ahora, si hay conexión, se trae el stock más reciente de la nube (fusionado con lo
-   que este dispositivo tenga pendiente de subir) justo antes de confirmar, y se
-   rechaza la venta si ya no alcanza. Esto no reemplaza un descuento atómico en el
-   servidor (eso lo hace vender_stock, más abajo), pero reduce drásticamente
-   la ventana en la que dos cajas pueden vender la misma última unidad.
+/* ---------------- VENTAS: COLA E IDEMPOTENCIA ----------------
+   Cada venta se registra en el servidor con UNA llamada a registrar_venta, que en una sola
+   transacción guarda la venta y sus movimientos, descuenta el stock, consume los lotes FIFO
+   y suma el fiado (supabase/migrations/…_registrar_venta.sql).
 
-   Ajuste importante: este pre-chequeo NO debe poder congelar la venta si el teléfono
-   tiene mala señal o hay microcortes — nada frustra más a un cliente en el mostrador
-   que una app trabada. Por eso tiene un tope de 2 segundos: si Supabase no responde a
-   tiempo, se continúa la venta con el stock que ya se tenía en el dispositivo (la
-   misma situación que si no hubiera conexión), y la respuesta tardía de la nube, si
-   llega después, se descarta en vez de pisar cambios más nuevos. */
-const TIMEOUT_STOCK_MS = 2000;
-async function refrescarDesdeNube(claves){
-  if(!db) return { atiempo:true }; // sin conexión: no hay forma de saber más que lo que ya tenemos localmente
-  let agotado = false;
-  const consulta = (async()=>{
-    try{
-      const respuestas = await Promise.all(claves.map(async(k)=>{
-        const { data, error } = await db.from('app_data').select('value').eq('key', k).maybeSingle();
-        return { k, data, error };
-      }));
-      if(agotado) return; // ya se decidió seguir con lo local; no pisar cambios más nuevos que hayan llegado después
-      respuestas.forEach(({k, data, error})=>{
-        if(error || !data || !Array.isArray(data.value)) return;
-        const fusionado = fusionar(k, data.value, ARRAYS[k]());
-        aplicarFusion(k, fusionado);
-        /* La base de comparación pasa a ser lo que acabamos de leer de la nube. Sin esto, al
-           guardar después de vender, fusionar() sumaba dos veces lo que otra caja había
-           cambiado entre medio (lo traía la nube y además contaba como "cambio mío"). */
-        snapshotDesde(k, data.value);
-      });
-    }catch(e){ console.error('No se pudo refrescar desde la nube antes de vender', claves, e); }
-  })();
-  const timeout = new Promise(resolve=>setTimeout(()=>{ agotado = true; resolve(); }, TIMEOUT_STOCK_MS));
-  await Promise.race([consulta, timeout]);
-  return { atiempo: !agotado };
-}
-/* Cada venta deja guardados (lotes, stock, movimientos, ventas...) subiendo en segundo plano.
-   Si la siguiente venta modifica esos mismos arreglos mientras la subida sigue en vuelo, la
-   respuesta de la nube (aplicarFusion) los reemplaza y se pierde el cambio nuevo. Por eso la
-   venta siguiente espera —con un tope— a que termine la subida anterior antes de tocar nada. */
-const TIMEOUT_GUARDADO_MS = 4000;
-let guardadoVentaEnCurso = null;
-async function esperarGuardadoVentaAnterior(){
-  if(!guardadoVentaEnCurso) return;
-  await Promise.race([guardadoVentaEnCurso, esperar(TIMEOUT_GUARDADO_MS)]);
-}
+   Antes de llamarla, la venta se guarda en una cola en este dispositivo. Si la respuesta no
+   llega (señal lenta, timeout, sin internet) NO se asume que falló: la venta queda en la
+   cola y se reintenta con el MISMO id. Si el servidor ya la tenía, devuelve lo que registró
+   sin aplicarla de nuevo, así una venta nunca descuenta el stock dos veces.
 
-/* Cierre real de la sobreventa: se probó en condiciones realistas (latencia de red +
-   dos cajas con algo de desfase) que el pre-chequeo de arriba, por sí solo, TODAVÍA
-   puede dejar pasar una sobreventa — es una lectura previa, no algo atómico. La única
-   forma de cerrarlo del todo es que la propia base de datos bloquee el descuento
-   mientras una venta está en curso, y eso solo lo puede hacer una función en el
-   servidor (ver supabase/migrations/…_vender_stock.sql). Esta función intenta usarla; si el
-   proyecto de Supabase todavía no tiene esa función instalada (soportado:false),
-   la app sigue funcionando igual que antes (con el pre-chequeo de arriba) en vez de
-   romperse — así no depende de que se aplique el SQL de inmediato. */
-const TIMEOUT_RPC_MS = 3000;
-async function descontarStockAtomico(items){
-  if(!db) return { soportado:false };
+   Mientras una venta espera en la cola, el stock que se muestra la descuenta (stockDe), pero
+   `p.stock` sigue siendo el valor confirmado por el servidor y ese descuento nunca se sube
+   por la sincronización: el stock de una venta tiene un solo escritor, registrar_venta. */
+const TIMEOUT_VENTA_MS = 10000;
+let colaVentas = [];             // [{ venta, offline }]
+const ventasEnVuelo = new Set(); // ids que se están enviando en este momento
+let procesandoCola = false;
+
+function guardarCola(){ escribirJSONLocal('cola_ventas', colaVentas); actualizarIndicadorSync(); }
+function cargarCola(){
+  colaVentas = (leerJSONLocal('cola_ventas', []) || []).filter(e=>e && e.venta && e.venta.id);
+  // si la app se cerró a mitad de un envío no sabemos si llegó: se trata como venta sin confirmar
+  colaVentas.forEach(e=>{ e.offline = true; });
+  guardarCola();
+}
+function quitarDeCola(id){
+  const antes = colaVentas.length;
+  colaVentas = colaVentas.filter(e=>e.venta.id !== id);
+  if(colaVentas.length !== antes) guardarCola();
+}
+function cantidadEnCola(productoId){
+  let n = 0;
+  colaVentas.forEach(e=>(e.venta.items||[]).forEach(it=>{ if(it.productoId===productoId) n += Number(it.cantidad||0); }));
+  return n;
+}
+// stock que se muestra: el confirmado por el servidor menos lo vendido que aún espera en la cola
+function stockDe(p){ return p ? Number(p.stock||0) - cantidadEnCola(p.id) : 0; }
+
+// Copia de lo que devolvió el servidor, fusionada con los cambios locales que aún no se suben.
+function incorporarRemoto(key, remoto){
+  aplicarFusion(key, fusionar(key, remoto, ARRAYS[key]()));
+  snapshotDesde(key, remoto);
+  if(pendientes[key]) escribirJSONLocal('base:'+key, remoto);
+  guardarEspejo(key, ARRAYS[key](), !!pendientes[key]);
+}
+async function refrescarClave(key){
+  if(!db) return;
   try{
-    const llamada = db.rpc('vender_stock', { items });
-    const timeout = new Promise((_, reject)=>setTimeout(()=>reject(new Error('RPC_TIMEOUT')), TIMEOUT_RPC_MS));
-    const { data, error } = await Promise.race([llamada, timeout]);
-    if(error){
-      // la función no existe todavía en este proyecto (código típico de PostgREST cuando
-      // no encuentra la función), o cualquier otro problema de RPC: se sigue con el
-      // camino anterior en vez de bloquear la venta.
-      const msg = String(error.message||error.code||'');
-      console.warn('vender_stock no disponible, se usa el camino anterior:', msg);
-      return { soportado:false };
+    const { data, error } = await db.from('app_data').select('value').eq('key', key).maybeSingle();
+    if(!error && data && Array.isArray(data.value)){ incorporarRemoto(key, data.value); render(); }
+  }catch(e){}
+}
+
+/* Envía una venta. Devuelve { estado, data }:
+   · 'ok': el servidor la registró (ahora o en un intento anterior).
+   · 'rechazada': el servidor respondió que NO la registró (sin stock, datos inválidos...).
+   · 'incierta': no sabemos qué pasó (timeout, red, sin sesión). Se reintenta con el mismo id. */
+async function enviarVentaServidor(entrada){
+  if(!db || dbEstado!=='ok' || !(await usuarioSesionNube())) return { estado:'incierta', motivo:'sin_conexion' };
+  try{
+    const llamada = db.rpc('registrar_venta', { p_venta: entrada.venta, p_offline: !!entrada.offline });
+    const expira = new Promise(res=>setTimeout(()=>res({ expiro:true }), TIMEOUT_VENTA_MS));
+    const r = await Promise.race([llamada, expira]);
+    if(r.expiro) return { estado:'incierta', motivo:'timeout' };
+    if(r.error){ console.warn('registrar_venta:', describirError(r.error)); return { estado:'incierta', motivo:'error' }; }
+    const d = r.data || {};
+    if(d.ok) return { estado:'ok', data:d };
+    if(d.motivo==='limite_excedido' || d.motivo==='sin_sesion') return { estado:'incierta', motivo:d.motivo };
+    return { estado:'rechazada', data:d };
+  }catch(e){ return { estado:'incierta', motivo:'red' }; }
+}
+
+// Incorpora a este dispositivo lo que devolvió el servidor para una venta confirmada.
+function aplicarVentaConfirmada(d){
+  const v = d.venta;
+  quitarDeCola(v.id);
+  const i = ventas.findIndex(x=>x.id===v.id);
+  if(i >= 0) ventas[i] = v; else ventas.push(v);
+  idsVentasSincronizadas.add(v.id);
+  (d.movimientos||[]).forEach(m=>{
+    if(!movimientos.some(x=>x.id===m.id)) movimientos.push(m);
+    idsMovimientosSincronizados.add(m.id);
+  });
+  guardarEspejo('ventas', ventas, !!pendientes.ventas);
+  guardarEspejo('movimientos', movimientos, !!pendientes.movimientos);
+  if(Array.isArray(d.productos)) incorporarRemoto('productos', d.productos);
+  if(Array.isArray(d.lotes)) incorporarRemoto('lotes', d.lotes);
+  if(Array.isArray(d.clientes)) incorporarRemoto('clientes', d.clientes);
+}
+function quitarVentaLocal(id){
+  quitarDeCola(id);
+  const i = ventas.findIndex(v=>v.id===id);
+  if(i >= 0) ventas.splice(i, 1);
+  guardarEspejo('ventas', ventas, !!pendientes.ventas);
+}
+// Copia local de una venta que espera confirmación (para la caja y los listados). El costo
+// es una estimación con el mismo FIFO; el definitivo lo calcula el servidor.
+function ventaPendienteLocal(venta){
+  const items = venta.items.map(it=>{
+    const prod = productos.find(x=>x.id===it.productoId);
+    return Object.assign({}, it, { costoTotal: consumirFIFO(it.productoId, it.cantidad, prod?prod.precio:it.precioUnitario, true) });
+  });
+  const costoTotal = items.reduce((a,it)=>a+it.costoTotal,0);
+  return Object.assign({}, venta, { items, costoTotal, utilidad: venta.total - costoTotal, _pendiente:true });
+}
+
+// Reintenta, en orden, las ventas que esperan confirmación.
+async function procesarColaVentas(){
+  if(procesandoCola || !colaVentas.length) return 0;
+  procesandoCola = true;
+  let confirmadas = 0, conRevision = 0;
+  try{
+    for(const entrada of colaVentas.slice()){
+      if(ventasEnVuelo.has(entrada.venta.id)) continue;
+      // si llegó a la cola, la venta ya se le entregó al cliente: se acepta aunque falte stock
+      entrada.offline = true;
+      ventasEnVuelo.add(entrada.venta.id);
+      let r;
+      try{ r = await enviarVentaServidor(entrada); } finally { ventasEnVuelo.delete(entrada.venta.id); }
+      if(r.estado==='ok'){
+        aplicarVentaConfirmada(r.data); confirmadas++;
+        if(r.data.venta && r.data.venta.revision) conRevision++;
+      } else if(r.estado==='rechazada'){
+        quitarVentaLocal(entrada.venta.id);
+        showToast('Una venta guardada sin conexión fue rechazada: ' + (r.data.mensaje || r.data.motivo || 'motivo desconocido') + '.', 'error');
+      } else {
+        break; // sin red o sin sesión: se reintenta más tarde, en el mismo orden
+      }
     }
-    return { soportado:true, resultado:data };
-  }catch(e){
-    console.warn('vender_stock no respondió a tiempo o falló, se usa el camino anterior:', e.message);
-    return { soportado:false };
+  } finally { procesandoCola = false; }
+  if(confirmadas) render();
+  if(conRevision) showToast(conRevision + (conRevision===1 ? ' venta hecha' : ' ventas hechas') + ' sin conexión dejaron stock negativo. Revisa el inventario.', 'error');
+  return confirmadas;
+}
+
+/* Merma o ajuste de salida: consume lotes FIFO, así que también lo hace el servidor, con el
+   mismo bloqueo que las ventas. Idempotente por el id del movimiento. */
+async function registrarSalidaServidor(mov){
+  if(!db || dbEstado!=='ok' || !(await usuarioSesionNube())) return { ok:false, mensaje:'Necesitas conexión a internet para registrar una salida de stock.' };
+  for(let intento=0; intento<3; intento++){
+    try{
+      const expira = new Promise(res=>setTimeout(()=>res({ expiro:true }), TIMEOUT_VENTA_MS));
+      const r = await Promise.race([db.rpc('registrar_salida_stock', { p_mov: mov }), expira]);
+      if(r.expiro || r.error) continue; // mismo id: si ya se registró, el servidor no lo repite
+      const d = r.data || {};
+      if(!d.ok) return { ok:false, mensaje: d.mensaje };
+      if(!movimientos.some(x=>x.id===d.movimiento.id)) movimientos.push(d.movimiento);
+      idsMovimientosSincronizados.add(d.movimiento.id);
+      guardarEspejo('movimientos', movimientos, !!pendientes.movimientos);
+      incorporarRemoto('productos', d.productos);
+      incorporarRemoto('lotes', d.lotes);
+      return { ok:true };
+    }catch(e){}
   }
+  return { ok:false, mensaje:'No hubo respuesta del servidor. Revisa el stock antes de volver a intentar.' };
 }
 /* Segunda confirmación antes de procesar la venta: un clic accidental o una mala
    manipulación del equipo (por ejemplo, un roce de pantalla) ya no basta para
@@ -3781,73 +3866,8 @@ async function confirmarVenta(){
 }
 async function procesarVenta(total){
   const btnConfirmar = $('#vc-confirmar') || $('#v-confirmar');
-  if(btnConfirmar){ btnConfirmar.disabled = true; btnConfirmar.textContent = 'Verificando stock...'; }
+  if(btnConfirmar){ btnConfirmar.disabled = true; btnConfirmar.textContent = 'Registrando...'; }
 
-  // si la venta anterior todavía está subiendo sus cambios, se espera (ver esperarGuardadoVentaAnterior)
-  await esperarGuardadoVentaAnterior();
-
-  const itemsParaRPC = carrito.map(c=>({ productoId:c.productoId, cantidad:c.cantidad }));
-  const atomico = await descontarStockAtomico(itemsParaRPC);
-  let chequeo = { atiempo: true };
-
-  if(atomico.soportado){
-    if(!atomico.resultado || !atomico.resultado.ok){
-      const motivo = atomico.resultado && atomico.resultado.motivo;
-      closeModal();
-      if(motivo === 'limite_excedido'){
-        // Rechazo intencional del servidor (no un error de red/RPC): no se debe
-        // reintentar por el camino de respaldo, o el límite quedaría sin efecto.
-        showToast('Se registraron demasiadas ventas seguidas desde esta conexión. Espera un momento y vuelve a intentar.', 'error');
-      } else if(motivo === 'sin_catalogo'){
-        showToast('No se pudo leer el catálogo de productos. Vuelve a intentar.', 'error');
-      } else {
-        const faltantes = (atomico.resultado && atomico.resultado.faltantes) || [];
-        const detalle = faltantes.map(f=>{
-          const p = productos.find(x=>x.id===f.productoId);
-          return p ? p.nombre : f.productoId;
-        }).join(', ');
-        showToast(`No hay stock suficiente de: ${detalle||'uno de los productos'}. Ajusta el carrito.`, 'error');
-      }
-      render();
-      return;
-    }
-    // el servidor ya descontó el stock de forma atómica (nadie más pudo colarse
-    // en el medio); se refleja el resultado exacto de la nube en este dispositivo
-    if(Array.isArray(atomico.resultado.productos)){
-      aplicarFusion('productos', atomico.resultado.productos);
-      guardarEspejo('productos', atomico.resultado.productos, false);
-      snapshotDesde('productos', atomico.resultado.productos);
-    }
-    /* Lotes: el servidor solo descuenta 'productos'. Antes de consumir FIFO se trae la
-       versión más reciente de los lotes (otra caja pudo consumirlos hace un momento), para
-       que el lote más antiguo elegido sea el que realmente sigue disponible. */
-    await refrescarDesdeNube(['lotes']);
-  } else {
-    // respaldo: todavía no se instaló la función SQL en este proyecto de Supabase
-    // (o no hay conexión, o falló/expiró la llamada). Se usa el pre-chequeo de stock, que
-    // reduce el riesgo de sobreventa pero, a diferencia del camino atómico, no lo elimina
-    // del todo. Se refrescan juntos stock y lotes para descontar ambos sobre lo más reciente.
-    chequeo = await refrescarDesdeNube(['productos','lotes']);
-    for(const c of carrito){
-      const p = productos.find(x=>x.id===c.productoId);
-      if(!p || Number(p.stock||0) < c.cantidad){
-        closeModal();
-        showToast(`No hay stock suficiente de ${p?p.nombre:'un producto'} (alguien más lo vendió recién). Ajusta el carrito.`, 'error');
-        render();
-        return;
-      }
-    }
-  }
-  // (No se muestra el aviso de "señal lenta" aquí todavía: si se dispara ahora, el
-  // toast de "Venta registrada" de más abajo lo reemplaza de inmediato porque
-  // comparten el mismo contenedor — el cajero nunca alcanzaría a leerlo. Se combina
-  // en un solo aviso al final.)
-  const items = carrito.map(c=>{
-    const prod = productos.find(x=>x.id===c.productoId);
-    const costoTotal = consumirFIFO(c.productoId, c.cantidad, prod?prod.precio:c.precio);
-    return {productoId:c.productoId, nombre:c.nombre, cantidad:c.cantidad, precioUnitario:c.precio, costoTotal};
-  });
-  const costoTotalVenta = items.reduce((a,it)=>a+it.costoTotal,0);
   let pagos;
   if(pagosMixtos){
     pagos = pagosMixtos.map(pg=>({metodo:pg.metodo, monto:Number(pg.monto)||0})).filter(pg=>pg.monto>0);
@@ -3855,44 +3875,55 @@ async function procesarVenta(total){
     pagos = [{metodo: metodoPagoSimple, monto: total}];
   }
   const metodoResumen = pagos.length>1 ? 'mixto' : pagos[0].metodo;
-  const montoFiado = pagos.filter(pg=>pg.metodo==='fiado').reduce((a,pg)=>a+pg.monto,0);
-  const venta = {id:uid(), tipo:'venta', fecha:Date.now(), items, total, costoTotal:costoTotalVenta, utilidad: total-costoTotalVenta, cliente:ventaCliente.trim(), clienteId:clienteVentaId, operador, pagos, metodoResumen};
-  carrito.forEach(c=>{
-    const p = productos.find(x=>x.id===c.productoId);
-    if(!atomico.soportado) p.stock = Number(p.stock||0) - c.cantidad; // si fue atómico, el servidor ya lo dejó descontado
-    movimientos.push({id:uid(), productoId:p.id, tipo:'venta', cantidad:-c.cantidad, motivo:'Venta '+venta.id, operador, fecha:Date.now()});
-  });
-  ventas.push(venta);
-  let clienteFiado = null;
-  if(montoFiado > 0 && clienteVentaId){
-    clienteFiado = clientes.find(x=>x.id===clienteVentaId) || null;
-    if(clienteFiado) clienteFiado.saldo = Number(clienteFiado.saldo||0) + montoFiado;
+  const venta = {
+    id: uid(), tipo:'venta', fecha: Date.now(),
+    items: carrito.map(c=>({ productoId:c.productoId, nombre:c.nombre, cantidad:c.cantidad, precioUnitario:c.precio })),
+    total, cliente: ventaCliente.trim(), clienteId: clienteVentaId, operador, pagos, metodoResumen
+  };
+
+  // 1) A la cola ANTES de llamar al servidor: si la app se cierra a mitad, la venta no se pierde.
+  const entrada = { venta, offline:false };
+  ventasEnVuelo.add(venta.id);
+  colaVentas.push(entrada); guardarCola();
+  let r;
+  try{ r = await enviarVentaServidor(entrada); } finally { ventasEnVuelo.delete(venta.id); }
+
+  if(r.estado==='rechazada'){
+    // el servidor respondió que no la registró: no pasó nada y el carrito sigue igual
+    quitarDeCola(venta.id);
+    closeModal();
+    const d = r.data || {};
+    if(d.motivo==='stock_insuficiente'){
+      const detalle = (d.faltantes||[]).map(f=>{
+        const p = productos.find(x=>x.id===f.productoId);
+        return p ? p.nombre : f.productoId;
+      }).join(', ');
+      showToast(`No hay stock suficiente de: ${detalle||'uno de los productos'}. Ajusta el carrito.`, 'error');
+      refrescarClave('productos');
+    } else {
+      showToast(d.mensaje || 'No se pudo registrar la venta.', 'error');
+    }
+    render();
+    return;
   }
+
+  if(r.estado==='ok'){
+    aplicarVentaConfirmada(r.data);
+  } else {
+    // 2) Sin respuesta: NO se asume que falló. Queda en la cola y se reintenta con el mismo id;
+    //    si el servidor ya la había registrado, no la aplica dos veces.
+    entrada.offline = true; guardarCola();
+    if(!ventas.some(v=>v.id===venta.id)) ventas.push(ventaPendienteLocal(venta));
+    guardarEspejo('ventas', ventas, !!pendientes.ventas);
+    setTimeout(()=>{ procesarColaVentas(); }, 5000);
+  }
+
   carrito = []; ventaCliente = ''; pagosMixtos = null; metodoPagoSimple = 'efectivo'; clienteVentaId = null; pagaConEfectivo = '';
-
-  /* Persistencia coordinada. Lotes y stock salen primero y juntos, para que el registro de
-     lotes y el stock de productos queden en la nube al mismo tiempo:
-       · camino atómico: el stock ya lo dejó guardado la función RPC; aquí se sincronizan de
-         inmediato los lotes que se acaban de consumir por FIFO.
-       · camino de contingencia: se suben stock (productos) y lotes juntos.
-     Se espera el resultado (con tope, para no congelar la caja con mala señal); lo que no
-     alcance a subir queda marcado como pendiente y se reintenta solo. */
-  const guardados = [];
-  if(!atomico.soportado) guardados.push(saveProductos());
-  guardados.push(saveLotes());
-  if(clienteFiado) guardados.push(saveClientes());
-  guardados.push(saveMovimientos(), saveVentas());
-  guardadoVentaEnCurso = Promise.allSettled(guardados);
-  await Promise.race([guardadoVentaEnCurso, esperar(TIMEOUT_GUARDADO_MS)]);
-
   closeModal();
   render();
-  showToast(
-    chequeo.atiempo
-      ? ('Venta registrada: ' + fmtCLP(total))
-      : ('Venta registrada: ' + fmtCLP(total) + ' (sin confirmar el stock con la nube por señal lenta)'),
-    chequeo.atiempo ? undefined : 'error'
-  );
+  showToast(r.estado==='ok'
+    ? 'Venta registrada: ' + fmtCLP(total)
+    : 'Venta guardada en este dispositivo: ' + fmtCLP(total) + '. Se confirma con la nube apenas haya señal.');
 }
 
 /* ---------------- CLIENTES Y FIADO ---------------- */
@@ -4155,10 +4186,10 @@ function generarPedido(pr){
 function openPedidoModal(pr, items){
   const rows = items.map(p=>{
     const ideal = Number(p.stockIdeal||0) || Number(p.stockMinimo||0)*2;
-    const pedir = Math.max(1, Math.round(ideal - Number(p.stock||0)));
+    const pedir = Math.max(1, Math.round(ideal - stockDe(p)));
     const padre = p.padreId ? productosPadre.find(x=>x.id===p.padreId) : null;
     const nombre = padre ? `${padre.nombre} (${p.variante||'—'})` : p.nombre;
-    return { sku:p.sku, nombre, stock:Number(p.stock||0), stockMinimo:Number(p.stockMinimo||0), ideal, pedir };
+    return { sku:p.sku, nombre, stock:stockDe(p), stockMinimo:Number(p.stockMinimo||0), ideal, pedir };
   });
   const totalUnidades = rows.reduce((a,r)=>a+r.pedir,0);
   openModal(`
@@ -4490,7 +4521,7 @@ function exportCSV(filename, rows, cols){
     await validarSesionGuardada();
     await initData();
     if(dbEstado !== 'ok') showToast('Sin conexión a la nube: estás trabajando en este dispositivo. Los cambios se suben solos al reconectar.', 'error');
-    else if(listaPendientes().length) reintentarSync(true);
+    else if(listaPendientes().length || colaVentas.length) reintentarSync(true);
   }catch(e){
     console.error('Error al arrancar', e);
     // aunque falle la nube o un CDN, la app tiene que poder abrirse igual

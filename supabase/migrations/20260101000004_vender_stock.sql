@@ -11,8 +11,8 @@
 -- (todo o nada) y devuelve el catálogo actualizado.
 --
 -- Ojo: la atomicidad del servidor no alcanza si el cliente, ante un timeout,
--- vuelve a descontar por otro camino. Ese problema está documentado en el
--- README ("Problemas abiertos").
+-- vuelve a descontar por otro camino. La migración 010 (registrar_venta)
+-- reemplaza esta función por una venta idempotente.
 -- ============================================================================
 
 create or replace function vender_stock(items jsonb)
