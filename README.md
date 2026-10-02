@@ -61,8 +61,11 @@ dispositivo escribió primero, se vuelve a leer y se **fusiona**.
 La fusión es a tres vías: compara la versión local, la de la nube y la última
 versión sincronizada (la "base"), y cada dispositivo aporta solo los campos que
 cambió. Los campos que se acumulan (stock, saldo de fiado, cantidad restante de
-un lote) se **suman** en vez de pisarse: si dos cajas vendieron a la vez, se
-cuentan las dos ventas.
+un lote) se **suman** en vez de pisarse.
+
+Las **ventas** no viajan por esa fusión: van a una cola en el dispositivo y se
+registran en el servidor con una función transaccional e idempotente (ver
+"Concurrencia de una venta").
 
 ## Seguridad
 
@@ -78,8 +81,9 @@ que protege los datos está en la base:
   rol de quien llama en la lista de usuarios. Si la administradora desactiva a
   alguien, pierde el acceso en ese momento.
 - **RLS por rol.** Sin sesión solo se puede leer la lista de nombres que
-  muestra el login. La vendedora solo escribe lo que usan una venta y la caja;
-  el resto, solo la administradora. Un trigger impide que alguien que no es
+  muestra el login. La vendedora solo puede abrir y cerrar caja y editar su
+  propio perfil; sus ventas pasan por `registrar_venta`. El resto, solo la
+  administradora. Un trigger impide que alguien que no es
   administradora cree usuarios o cambie roles, aunque escriba directo a la API.
 - **Claves.** Se guardan con PBKDF2 en tablas sin acceso desde la API.
   Cambiar una clave exige sesión. Para recuperar el acceso (pregunta secreta,
@@ -90,81 +94,105 @@ que protege los datos está en la base:
 El detalle y las pruebas están en
 `supabase/migrations/20260101000009_autenticacion_real.sql`.
 
-## Problema abierto: concurrencia de una venta
+## Concurrencia de una venta
 
-Este es el problema que estoy documentando y resolviendo en público.
+Lo documenté en dos partes: primero el problema y después la solución, ambos
+reproducidos y medidos contra la app publicada.
 
-El stock se descuenta en el servidor con `SELECT … FOR UPDATE`, que pone en
-fila las ventas simultáneas. Pero el navegador espera esa respuesta solo 3
-segundos (`Promise.race`). Si se agota, asume que falló y descuenta el stock
-por un camino de respaldo. Como `Promise.race` no cancela la petición, el
-servidor puede haber hecho `COMMIT` igual: **una venta, dos descuentos.**
+### El problema
+
+El stock se descontaba en el servidor con `SELECT … FOR UPDATE`, que pone en
+fila las ventas simultáneas. Pero el navegador esperaba esa respuesta solo 3
+segundos (`Promise.race`). Si se agotaba, asumía que había fallado y
+descontaba el stock por un camino de respaldo. Como `Promise.race` no cancela
+la petición, el servidor podía haber hecho `COMMIT` igual: **una venta, dos
+descuentos.**
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Caja (navegador)
     participant DB as Postgres
-    Note over DB: stock = 5
+    Note over DB: stock = 10
     C->>DB: rpc vender_stock(cantidad: 2)
-    Note over DB: FOR UPDATE · 5 → 3 · COMMIT ✓
+    Note over DB: FOR UPDATE · 10 → 8 · COMMIT ✓
     Note over C,DB: la respuesta viaja con señal lenta…
     Note over C: 3 s sin respuesta → "la RPC falló"
     C->>DB: respaldo: SELECT stock
-    DB-->>C: 3
-    C->>C: 3 − 2 = 1
-    C->>DB: UPDATE stock = 1
-    Note over DB: stock = 1 ✗ (2 vendidas, 4 descontadas)
-    DB-->>C: { ok: true } llega tarde: nadie la usa
+    DB-->>C: 8
+    C->>DB: UPDATE stock = 8 − 2 = 6
+    Note over DB: stock = 6 ✗ (2 vendidas, 4 descontadas)
 ```
 
-**Reproducido:** con la app publicada y la respuesta de la RPC retrasada 6
-segundos, un producto con stock 10 quedó en 6 después de vender 2 unidades.
-La base registró una sola venta y un solo movimiento.
+Medido en la app publicada, con la respuesta retrasada 6 segundos: stock 10,
+venta de 2 unidades, **stock final 6**.
 
-El código está en `index.html`: `descontarStockAtomico` (el timeout) y
-`procesarVenta` (el camino de respaldo).
+No era lo único: el costo FIFO se calculaba en el navegador, fuera del bloqueo;
+una venta eran cinco escrituras independientes (stock, lotes, fiado, venta y
+movimientos); y al sincronizar ventas hechas sin internet, un stock negativo se
+corregía a 0 en silencio.
 
-### Otros problemas encontrados en el mismo flujo
+### La solución
 
-1. **Lotes FIFO fuera del bloqueo.** El costo se calcula en el navegador
-   (`consumirFIFO`), tanto en una venta como en un ajuste de salida (merma).
-   Dos salidas simultáneas del mismo producto consumen el mismo lote; al
-   fusionar, ese lote queda negativo y la utilidad sale mal.
-2. **La venta no es atómica.** Son varias escrituras independientes (stock,
-   lotes, fiado, venta, movimientos). Si una falla, el resto queda aplicado
-   hasta que el reintento la complete.
-3. **Sobreventa escondida.** Al sincronizar ventas hechas sin internet, la
-   fusión deja en 0 cualquier stock negativo, sin avisar.
-4. **Validación del servidor.** La interfaz agrupa productos repetidos y no
-   permite cantidades de 0 o menos, pero `vender_stock` no lo valida si se la
-   llama directamente.
+**1. Una venta es una transacción.** `registrar_venta` (migración 010) inserta
+la venta y sus movimientos, descuenta el stock, consume los lotes FIFO
+(calcula el costo en el servidor) y suma el fiado. Todo o nada. Las mermas
+pasan por `registrar_salida_stock`, con el mismo bloqueo.
 
-### Plan de solución
+**2. Idempotencia.** Cada venta lleva un id generado en el dispositivo. La
+función revisa si ese id ya existe *después* de tomar el bloqueo: si dos
+reintentos llegan juntos, el segundo espera al primero y lo encuentra
+registrado. Devuelve lo que ya se guardó, sin aplicarlo de nuevo.
 
-1. **Una función `registrar_venta`** que, en una sola transacción, inserte la
-   venta y sus movimientos, descuente el stock, consuma los lotes FIFO
-   (calculando el costo en el servidor) y sume el fiado. Todo o nada.
-2. **Idempotencia por id de venta.** El id ya se genera en el dispositivo. Si
-   la misma venta llega dos veces, el servidor devuelve el resultado guardado
-   en vez de aplicarla de nuevo. Ante un timeout se reintenta la misma
-   llamada; desaparece el camino de respaldo.
-3. **Un solo escritor por dato.** Si el servidor mueve el stock, los lotes y
-   el saldo de una venta, la sincronización deja de subir esos cambios. Si no,
-   se volverían a contar.
-4. **Ventas sin internet como una cola de eventos,** cada una con su id, que
-   se envían a la misma función al reconectar. Una venta offline ya ocurrió:
-   se acepta aunque deje el stock negativo y queda marcada para revisión, en
-   vez de esconderse en 0.
-5. **Toda salida de inventario consume lotes en el servidor,** también los
-   ajustes por merma.
-6. **Validación en el servidor:** cantidades mayores a 0 y líneas repetidas
-   agrupadas.
-7. **Pruebas** con ventas concurrentes, timeouts forzados y reintentos.
+**3. Un timeout ya no es un fallo.** Antes de llamar al servidor, la venta se
+guarda en una cola en el dispositivo. La respuesta tiene tres estados:
+registrada, rechazada (por ejemplo, sin stock) o **incierta** (timeout, sin
+red). Si es incierta, la venta queda en la cola y se reintenta con el mismo id.
+Ya no existe un camino de respaldo.
 
-A futuro, por escala y no por corrección: pasar el stock de un JSON a filas,
-para no bloquear todo el catálogo en cada venta. Con una o dos cajas, el
-bloqueo de una sola fila no es un cuello de botella.
+**4. Un solo escritor.** Mientras una venta espera en la cola, la pantalla
+muestra el stock descontado (`stockDe`), pero ese descuento nunca se sube por
+la sincronización: el stock de una venta solo lo mueve `registrar_venta`. La
+vendedora ya no puede escribir el catálogo directamente.
+
+**5. Sin conexión no se esconde nada.** Una venta hecha offline ya ocurrió en
+el mundo real: al sincronizar se acepta aunque deje el stock negativo, queda
+marcada para revisión y la app avisa. El stock negativo se muestra, ya no se
+corrige a 0.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Caja (navegador)
+    participant Q as Cola local
+    participant DB as Postgres
+    C->>Q: guardar venta (id v-123)
+    C->>DB: registrar_venta(v-123)
+    Note over DB: FOR UPDATE · 10 → 8 · COMMIT ✓
+    Note over C,DB: la respuesta se demora más de 10 s
+    Note over C: estado incierto: la venta sigue en la cola
+    C->>DB: reintento: registrar_venta(v-123)
+    DB-->>C: { ok, duplicada: true } · stock 8
+    C->>Q: quitar v-123
+```
+
+### Cómo lo probé
+
+| Prueba | Resultado |
+|---|---|
+| El escenario de la parte 1, con la respuesta retrasada 12 s (más que el timeout) | La app guarda la venta en la cola, reintenta a los 5 s, el servidor responde `duplicada`: **stock final 8** |
+| Venta con la red cortada, luego vuelve la conexión | Se registra sola al reconectar: stock 8, marcada `sinConexion` |
+| 10 ventas simultáneas por la última unidad (HTTP en paralelo) | **1 aplicada, 9 rechazadas**: el stock queda en 0, nunca negativo |
+| La misma venta enviada 8 veces en paralelo | **1 aplicada, 7 duplicadas**: el stock baja una sola vez |
+| Casos de borde en SQL | Líneas repetidas agrupadas, cantidades negativas rechazadas, FIFO entre dos lotes con el costo correcto, fiado a un cliente inexistente deshecho por completo |
+
+### Pendiente
+
+**La caja:** dos dispositivos pueden abrir turno a la vez, y un abono todavía
+son dos escrituras (saldo y registro). A futuro, por escala y no por
+corrección, el stock podría pasar de un JSON a filas para no bloquear todo el
+catálogo en cada venta; con una o dos cajas, ese bloqueo no es un cuello de
+botella.
 
 ## Backend
 
@@ -183,13 +211,15 @@ En `supabase/migrations/`, en orden:
 | 007 | `recuperacion_otp` | Recuperación de clave con código por correo o SMS. |
 | 008 | `notificaciones_push` | Aviso push a la administradora en cada venta. |
 | 009 | `autenticacion_real` | Sesiones de Supabase Auth, RLS por rol y credenciales protegidas. |
+| 010 | `registrar_venta` | Venta transaccional e idempotente, mermas con FIFO en el servidor. |
 
 ### Funciones que usa la app
 
 | Función | Qué hace |
 |---|---|
 | Edge Function `iniciar-sesion` | Valida la clave (o la prueba de recuperación junto con la clave nueva) y entrega la sesión. |
-| `vender_stock(items)` | Descuento de stock atómico. Todo o nada. Requiere sesión. |
+| `registrar_venta(venta, offline)` | Registra una venta completa en una transacción. Idempotente por id. |
+| `registrar_salida_stock(movimiento)` | Merma o ajuste de salida, con FIFO. Solo administradora. Idempotente por id. |
 | `verificar_credencial(usuario, tipo, valor)` | Valida una clave, respuesta secreta o código maestro, con bloqueo tras 5 intentos. |
 | `guardar_credencial(usuario, tipo, valor)` | Cambia una clave o respuesta. La administradora puede cambiar cualquiera; el resto, solo la propia. |
 | `eliminar_credencial(usuario)` | Elimina las credenciales de una persona. Solo administradora. |
@@ -229,7 +259,7 @@ Requiere Docker y la [CLI de Supabase](https://supabase.com/docs/guides/local-de
 
 ```bash
 supabase start      # levanta Postgres, Auth, Edge Functions y Studio
-supabase db reset   # aplica las 9 migraciones sobre una base limpia
+supabase db reset   # aplica las 10 migraciones sobre una base limpia
 supabase functions serve
 ```
 
