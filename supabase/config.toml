@@ -1,0 +1,49 @@
+# Configuración de Supabase CLI para levantar el stack completo en local
+# (Postgres, PostgREST, Auth, Edge Functions y Studio) con `supabase start`.
+# Si una versión nueva de la CLI pide claves que falten aquí, `supabase init`
+# en otro directorio genera la plantilla actualizada para comparar.
+
+project_id = "pos"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public"]
+max_rows = 1000
+
+[db]
+port = 54322
+major_version = 16
+
+[studio]
+enabled = true
+port = 54323
+
+[inbucket]
+enabled = false
+
+[storage]
+enabled = false
+
+[auth]
+enabled = true
+site_url = "http://localhost:3000"
+additional_redirect_urls = []
+jwt_expiry = 3600
+enable_signup = false
+# Las sesiones las crea la Edge Function iniciar-sesion (enlace mágico generado
+# en el servidor, nunca enviado por correo), por eso el registro público está
+# desactivado. Ver README, sección "Seguridad".
+
+[edge_runtime]
+enabled = true
+
+[functions.notificar-venta]
+verify_jwt = false
+
+[functions.despachar-otp]
+verify_jwt = false
+
+[functions.iniciar-sesion]
+verify_jwt = false
