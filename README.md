@@ -98,6 +98,8 @@ El detalle y las pruebas están en
 
 Lo documenté en dos partes: primero el problema y después la solución, ambos
 reproducidos y medidos contra la app publicada.
+El código tal como estaba en cada parte quedó etiquetado:
+[`parte-1`](../../tree/parte-1) (el bug) y [`parte-2`](../../tree/parte-2) (la solución).
 
 ### El problema
 
