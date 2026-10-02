@@ -12,7 +12,6 @@
 -- ============================================================================
 
 revoke execute on function public.fn_respaldo_diario()              from public, anon, authenticated;
-revoke execute on function public.fn_restaurar_respaldo(bigint)     from public, anon, authenticated;
 revoke execute on function public.fn_limpiar_limite_llamadas()      from public, anon, authenticated;
 -- Las 8 funciones rpc_* son de un login anterior y en una base nueva no
 -- existen: cada revoke va dentro de to_regprocedure(...) para que la migración
