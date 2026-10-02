@@ -1,0 +1,46 @@
+# En cada push: levanta un Supabase desde cero (Postgres, Auth, API REST y
+# Edge Functions), aplica las migraciones y corre tres capas de pruebas.
+name: Pruebas
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pruebas:
+    name: Postgres + Supabase
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Levantar Supabase y aplicar las migraciones
+        run: supabase start -x studio,imgproxy,realtime,storage-api,logflare,vector,supavisor
+
+      - name: Tests de base de datos (pgTAP)
+        run: supabase test db
+
+      - name: Concurrencia real (conexiones en paralelo)
+        run: |
+          eval "$(supabase status -o env)"
+          DATABASE_URL="$DB_URL" tests/concurrencia.sh
+
+      - name: Integración HTTP (login, sesión y ventas por la API)
+        run: |
+          eval "$(supabase status -o env)"
+          supabase functions serve > functions.log 2>&1 &
+          for i in $(seq 1 60); do
+            codigo=$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS "$API_URL/functions/v1/iniciar-sesion" || true)
+            [ "$codigo" = "200" ] && break
+            sleep 2
+          done
+          tests/integracion.sh
+
+      - name: Logs de las Edge Functions
+        if: failure()
+        run: cat functions.log || true
