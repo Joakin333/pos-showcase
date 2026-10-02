@@ -1,5 +1,7 @@
 # POS offline-first para comercio de barrio
 
+[![Pruebas](https://github.com/Joakin333/pos-showcase/actions/workflows/pruebas.yml/badge.svg)](https://github.com/Joakin333/pos-showcase/actions/workflows/pruebas.yml)
+
 Un punto de venta pensado para almacenes y bazares atendidos por una o dos
 personas, que venden **desde el celular**, sin computador en el mesón y con
 una señal móvil que va y viene.
@@ -196,6 +198,32 @@ corrección, el stock podría pasar de un JSON a filas para no bloquear todo el
 catálogo en cada venta; con una o dos cajas, ese bloqueo no es un cuello de
 botella.
 
+## Pruebas
+
+Cada push levanta un Supabase desde cero en GitHub Actions (Postgres, Auth,
+API REST y Edge Functions), aplica las 10 migraciones y corre tres capas de
+pruebas (`.github/workflows/pruebas.yml`):
+
+| Capa | Qué prueba | Dónde |
+|---|---|---|
+| **Base de datos** (pgTAP, 40 pruebas) | Qué puede hacer cada rol (anónimo, vendedora, administradora), RLS, credenciales, y `registrar_venta`: idempotencia, FIFO entre lotes, validación, ventas offline, fiado y mermas. | `supabase/tests/database/` |
+| **Concurrencia real** | 20 conexiones compiten por la última unidad (debe aplicarse 1) y la misma venta llega 10 veces a la vez (debe aplicarse 1 y el resto volver como duplicadas). | `tests/concurrencia.sh` |
+| **Integración HTTP** | Igual que la app: login en la Edge Function, canje del token, JWT con el usuario en `app_metadata`, y ventas por la API con y sin sesión. | `tests/integracion.sh` |
+
+**¿Detectan errores de verdad?** Lo comprobé con un control negativo: en una
+rama aparte desactivé la revisión de idempotencia de `registrar_venta`. CI
+falló en exactamente 1 de las 24 pruebas: *"la misma venta enviada otra vez se
+reconoce como duplicada"*. Las pruebas de stock siguieron pasando, porque la
+clave primaria de `ventas_registro` impidió el segundo descuento. Son dos
+capas distintas: la clave primaria protege los datos, y la idempotencia hace
+que el reintento termine bien en vez de quedar fallando para siempre en la
+cola.
+
+**Lo primero que encontró:** la migración 006 quitaba permisos a una función
+antes de crearla. En producción nunca falló porque la función ya existía;
+aplicada desde cero, sí. Las migraciones nunca se habían probado sobre una
+base vacía.
+
 ## Backend
 
 ### Migraciones
@@ -260,9 +288,10 @@ solo funciona con la app agregada a la pantalla de inicio (iOS 16.4 o superior).
 Requiere Docker y la [CLI de Supabase](https://supabase.com/docs/guides/local-development).
 
 ```bash
-supabase start      # levanta Postgres, Auth, Edge Functions y Studio
-supabase db reset   # aplica las 10 migraciones sobre una base limpia
-supabase functions serve
+supabase start            # levanta Postgres, Auth, Edge Functions y aplica las migraciones
+supabase test db          # pruebas pgTAP
+tests/concurrencia.sh     # concurrencia real contra el Postgres local
+supabase functions serve  # en otra terminal; después: tests/integracion.sh
 ```
 
 Luego cambia `SUPABASE_URL` y `SUPABASE_KEY` al inicio de `index.html` por
@@ -288,13 +317,16 @@ La mayor parte del uso real es desde el celular de quien atiende la caja:
 ## Estructura
 
 ```
+.github/workflows/          CI: levanta Supabase y corre las pruebas en cada push
 index.html                  la app completa (HTML, CSS y JS)
 sw.js                       service worker (solo avisos push)
 supabase/
   config.toml               configuración para correr el backend en local
   migrations/               esquema, funciones y políticas, en orden
+  tests/database/           pruebas pgTAP
   functions/
     iniciar-sesion/         login: valida la clave y entrega la sesión
     despachar-otp/          envía el código de recuperación por correo o SMS
     notificar-venta/        envía el aviso push de cada venta
+tests/                      concurrencia real e integración HTTP
 ```
