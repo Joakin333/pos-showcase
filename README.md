@@ -101,11 +101,47 @@ que protege los datos está en la base:
   límite por IP.
 - **Primera configuración.** No hay cuentas por defecto: quien abre una
   instalación nueva crea su propia cuenta de administradora.
+- **Mínimo privilegio.** Cada rol ve y escribe solo lo que necesita, decidido
+  por la base y no por la interfaz. La vendedora lee el catálogo, los turnos y
+  las ventas de su turno abierto; no lee lotes (costos), clientes ni
+  movimientos, y no puede escribir en el historial. Sus ventas entran solo por
+  `registrar_venta`. Las tablas con datos sensibles no tienen ningún permiso
+  para los roles de la API.
+- **Superficie de la API congelada.** Una prueba lista exactamente qué
+  funciones puede ejecutar un anónimo (5) y quién con sesión (14 más). Si
+  alguien agrega una función ejecutable sin querer, CI se pone rojo.
+- **Registro público de cuentas cerrado,** también en la base: solo se aceptan
+  cuentas del dominio interno que crea la Edge Function de login.
+- **Frontend.** Cabeceras de seguridad (`_headers`: CSP, `X-Frame-Options`,
+  etc.), librerías externas con versión exacta y verificación de integridad
+  (SRI), y exportaciones a Excel/CSV que neutralizan fórmulas (`=`, `+`, `-`, `@`).
 - **Límite de llamadas** en las funciones expuestas. La IP se toma del
   encabezado que fija la infraestructura, no del que escribe el cliente.
 
-El detalle y las pruebas están en
-`supabase/migrations/20260101000009_autenticacion_real.sql`.
+El detalle está en las migraciones `009`, `011` y `012`.
+
+### Auditoría
+
+Antes de entregar el sistema a un negocio real lo audité atacándolo desplegado,
+como anónimo y como vendedora. Lo que encontré y cerré (migración `012`):
+
+| Hallazgo | Gravedad |
+|---|---|
+| Una vendedora leía por la API costos, clientes con sus deudas y la utilidad de cada venta (la interfaz se lo ocultaba, la base no) | Alta |
+| Podía insertar ventas y movimientos falsos en el historial, u ocupar el id de una venta futura | Alta |
+| El registro público de Supabase Auth estaba abierto (cualquiera creaba cuentas) | Alta |
+| En una base creada desde cero, `pbkdf2_hmac_sha256` era ejecutable por cualquiera: se podía agotar la CPU de la base | Alta |
+| Podía cambiar la pregunta de seguridad de la administradora | Media |
+| Tablas selladas con todos los permisos para `anon` (solo las protegía RLS) | Media |
+| Librería externa cargada sin versión fija ni integridad; sin cabeceras de seguridad | Media |
+| Exportaciones sin neutralizar fórmulas; `LIKE` con `_` como comodín | Baja |
+
+Lo que resistió: tokens falsificados (incluido `alg=none`), inyección SQL,
+entradas gigantes o mal formadas, abuso de las Edge Functions y XSS.
+
+La prueba de contrato de la API encontró el cuarto hallazgo al correr sobre una
+instalación nueva, y la prueba de integración evitó que mi primer arreglo del
+registro público rompiera el primer inicio de sesión de cualquier persona nueva.
 
 ## Concurrencia de una venta
 
@@ -212,13 +248,14 @@ botella.
 ## Pruebas
 
 Cada push levanta un Supabase desde cero en GitHub Actions (Postgres, Auth,
-API REST y Edge Functions), aplica las migraciones y corre tres capas de
+API REST y Edge Functions), aplica las migraciones y corre cuatro capas de
 pruebas (`.github/workflows/pruebas.yml`):
 
 | Capa | Qué prueba | Dónde |
 |---|---|---|
-| **Base de datos** (pgTAP) | Qué puede hacer cada rol (anónimo, vendedora, administradora), RLS, credenciales, y `registrar_venta`: idempotencia, FIFO entre lotes, validación, ventas offline, fiado y mermas. | `supabase/tests/database/` |
+| **Base de datos** (pgTAP) | Qué puede hacer y ver cada rol (anónimo, vendedora, administradora), RLS, mínimo privilegio, la lista cerrada de funciones expuestas, el bloqueo progresivo del login, y `registrar_venta`: idempotencia, FIFO entre lotes, validación, ventas offline, fiado y mermas. | `supabase/tests/database/` |
 | **Concurrencia real** | 20 conexiones compiten por la última unidad (debe aplicarse 1) y la misma venta llega 10 veces a la vez (debe aplicarse 1 y el resto volver como duplicadas). | `tests/concurrencia.sh` |
+| **Estrés funcional** | Cientos de operaciones mezcladas en paralelo (ventas, fiados, mermas y reenvíos duplicados). Al final cuadran exactamente el stock, los lotes, el costo FIFO calculado de forma independiente, el historial y los saldos. | `tests/estres.py` |
 | **Integración HTTP** | Igual que la app: login en la Edge Function, canje del token, JWT con el usuario en `app_metadata`, y ventas por la API con y sin sesión. | `tests/integracion.sh` |
 
 **¿Detectan errores de verdad?** Lo comprobé con un control negativo: en una
@@ -254,6 +291,7 @@ En `supabase/migrations/`, en orden:
 | 009 | `autenticacion_real` | Sesiones de Supabase Auth, RLS por rol y credenciales protegidas. |
 | 010 | `registrar_venta` | Venta transaccional e idempotente, mermas con FIFO en el servidor. |
 | 011 | `endurecimiento_login` | Bloqueo progresivo, límite por IP y por cuenta, un envío por código de recuperación. |
+| 012 | `minimo_privilegio` | Cada rol ve y escribe solo lo necesario, tablas selladas sin permisos, registro público cerrado. |
 
 ### Funciones que usa la app
 
@@ -303,6 +341,7 @@ Requiere Docker y la [CLI de Supabase](https://supabase.com/docs/guides/local-de
 supabase start            # levanta Postgres, Auth, Edge Functions y aplica las migraciones
 supabase test db          # pruebas pgTAP
 tests/concurrencia.sh     # concurrencia real contra el Postgres local
+python3 tests/estres.py   # estrés funcional con invariantes contables
 supabase functions serve  # en otra terminal; después: tests/integracion.sh
 ```
 
@@ -330,6 +369,7 @@ La mayor parte del uso real es desde el celular de quien atiende la caja:
 ```
 .github/workflows/          CI: levanta Supabase y corre las pruebas en cada push
 index.html                  la app completa (HTML, CSS y JS)
+_headers                    cabeceras de seguridad (CSP, X-Frame-Options, …)
 sw.js                       service worker (solo avisos push)
 supabase/
   config.toml               configuración para correr el backend en local
@@ -339,5 +379,5 @@ supabase/
     iniciar-sesion/         login: valida la clave y entrega la sesión
     despachar-otp/          envía el código de recuperación por correo o SMS
     notificar-venta/        envía el aviso push de cada venta
-tests/                      concurrencia real e integración HTTP
+tests/                      concurrencia real, estrés e integración HTTP
 ```

@@ -75,6 +75,13 @@ verificar "sin sesión: solo se ve la lista de usuarios" "usuarios" "$(claves -H
 verificar "con sesión: se ve el catálogo" "si" \
   "$(claves -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ACCESS" | grep -q productos && echo si || echo no)"
 
+# el registro público de cuentas está cerrado (config + disparador en la base)
+verificar "registro público: crear una cuenta con la llave publicable es rechazado" "rechazado" \
+  "$(curl -s -X POST "$API_URL/auth/v1/signup" "${H[@]}" -d '{"email":"intruso@correo-de-prueba.cl","password":"Clave-Intruso-123"}' | json "'rechazado' if not d.get('id') else 'CREADO'")"
+# una vendedora no lee costos ni clientes por la API
+verificar "una vendedora no ve lotes (costos) ni clientes por la API" "productos,usuarios" \
+  "$(claves -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ACCESS")"
+
 VENTA='{"p_offline":false,"p_venta":{"id":"int-venta-1","operador":"Caja","pagos":[{"metodo":"efectivo","monto":2000}],"items":[{"productoId":"int-prod","nombre":"x","cantidad":2,"precioUnitario":1000}]}}'
 rpc() { curl -s -X POST "$API_URL/rest/v1/rpc/registrar_venta" "${H[@]}" "$@" -d "$VENTA"; }
 verificar "sin sesión: registrar_venta está bloqueada" "42501" "$(rpc | json "d.get('code')")"

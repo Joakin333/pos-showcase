@@ -1,0 +1,13 @@
+# Cabeceras de seguridad (Cloudflare Pages las aplica a todo el sitio).
+# La app es un solo HTML con script y estilos en línea, por eso 'unsafe-inline';
+# aun así la política limita de DÓNDE se pueden cargar scripts y A DÓNDE puede
+# conectarse la app, que es lo que frena una exfiltración si alguna vez hubiera
+# un XSS. Las librerías externas además llevan verificación de integridad (SRI).
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(self), microphone=(), geolocation=(), payment=(), usb=()
+  Cross-Origin-Opener-Policy: same-origin
+  Strict-Transport-Security: max-age=31536000

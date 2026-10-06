@@ -401,10 +401,11 @@ button, .btn, .chip, .tab, .quick-item, .user-pick, .link-btn,
 <div id="print-area"></div>
 
 <!-- defer: si un CDN se cae o va lento, la aplicación arranca igual y las librerías se enganchan cuando lleguen -->
-<script defer src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" onerror="window.__cdnFalla=(window.__cdnFalla||0)+1"></script>
-<script defer src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.4/html5-qrcode.min.js" onerror="window.__cdnFalla=(window.__cdnFalla||0)+1"></script>
-<script defer src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" onerror="window.__cdnFalla=(window.__cdnFalla||0)+1"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2" onerror="window.__cdnFalla=(window.__cdnFalla||0)+1"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous" onerror="window.__cdnFalla=(window.__cdnFalla||0)+1"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.4/html5-qrcode.min.js" integrity="sha384-LxBm2/oFd/wfoABz4wsZ4FnGMQVAy5QI1bhf+kHA4YKi0aFe1BJTWosfTWmlMNNY" crossorigin="anonymous" onerror="window.__cdnFalla=(window.__cdnFalla||0)+1"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" integrity="sha384-3zSEDfvllQohrq0PHL1fOXJuC/jSOO34H46t6UQfobFOmxE5BpjjaIJY5F2/bMnU" crossorigin="anonymous" onerror="window.__cdnFalla=(window.__cdnFalla||0)+1"></script>
+<!-- Librerías con versión exacta y verificación de integridad (SRI): si el archivo del CDN cambia aunque sea un byte, el navegador lo rechaza. Para actualizar una, recalcula su hash. -->
+<script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2" integrity="sha384-WgXwGL6fUsYJWNaKJgVbrJKGRQwc1vieh2oy4kw9nXqpNDz3tdSsqEYUgeHD/NuF" crossorigin="anonymous" onerror="window.__cdnFalla=(window.__cdnFalla||0)+1"></script>
 
 <script>
 (function(){
@@ -4518,7 +4519,7 @@ function exportarVentasExcel(dias){
     ['producto','Producto'], ['cantidad','Cantidad'], ['precioUnitario','Precio unitario'],
     ['subtotal','Subtotal'], ['totalVenta','Total venta'], ['metodos','Forma(s) de pago']
   ];
-  const celda = (v)=> (v===''||v==null) ? '' : escapeHtml(String(v));
+  const celda = (v)=> (v===''||v==null) ? '' : escapeHtml(String(sinFormula(v)));
   const thead = '<tr>'+cols.map(c=>`<th style="background:#EAE6DC;font-weight:bold;">${c[1]}</th>`).join('')+'</tr>';
   const tbody = filas.map(f=>'<tr>'+cols.map(c=>`<td>${celda(f[c[0]])}</td>`).join('')+'</tr>').join('');
   const html = `<html><head><meta charset="UTF-8"></head><body><table border="1">${thead}${tbody}</table></body></html>`;
@@ -4529,10 +4530,13 @@ function exportarVentasExcel(dias){
   URL.revokeObjectURL(url);
   showToast('Reporte generado: '+filas.length+' fila(s).');
 }
+/* Un texto que empieza con = + - @ se ejecutaría como fórmula al abrir el archivo en Excel
+   (por ejemplo un cliente llamado =HYPERLINK(...)). Se le antepone una comilla para que sea texto. */
+const sinFormula = (v) => (typeof v === 'string' && /^[=+\-@\t\r]/.test(v)) ? "'" + v : v;
 function exportCSV(filename, rows, cols){
   const header = cols.join(',');
   const body = rows.map(r=>cols.map(c=>{
-    let v = r[c]; if(v==null) v='';
+    let v = sinFormula(r[c]); if(v==null) v='';
     v = String(v).replace(/"/g,'""');
     return /[",\n]/.test(v) ? `"${v}"` : v;
   }).join(',')).join('\n');

@@ -17,7 +17,7 @@ jobs:
 
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
+          version: 2.119.0   # fija: con "latest" el paso falla si GitHub limita la consulta de versiones
 
       - name: Levantar Supabase y aplicar las migraciones
         run: supabase start -x studio,imgproxy,realtime,storage-api,logflare,vector,supavisor
@@ -29,6 +29,11 @@ jobs:
         run: |
           set -a; eval "$(supabase status -o env)"; set +a
           DATABASE_URL="$DB_URL" tests/concurrencia.sh
+
+      - name: Estrés funcional (operaciones mezcladas en paralelo e invariantes contables)
+        run: |
+          set -a; eval "$(supabase status -o env)"; set +a
+          DATABASE_URL="$DB_URL" python3 tests/estres.py
 
       - name: Integración HTTP (login, sesión y ventas por la API)
         run: |
