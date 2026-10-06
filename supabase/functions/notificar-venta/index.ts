@@ -16,9 +16,12 @@ const VAPID_PRIVATE_KEY = Deno.env.get("VAPID_PRIVATE_KEY") ?? "";
 const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET") ?? "";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+// Nombre del negocio y contacto del aviso: secrets NOMBRE_NEGOCIO y CONTACTO_VAPID (opcionales).
+const NEGOCIO = Deno.env.get("NOMBRE_NEGOCIO") ?? "POS";
+const CONTACTO_VAPID = Deno.env.get("CONTACTO_VAPID") ?? "mailto:soporte@example.com";
 
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
-  webpush.setVapidDetails("mailto:soporte@tu-negocio.pages.dev", VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+  webpush.setVapidDetails(CONTACTO_VAPID, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 }
 
 Deno.serve(async (req) => {
@@ -39,7 +42,7 @@ Deno.serve(async (req) => {
     : (venta.metodoResumen || "");
   const total = Number(venta.total || 0).toLocaleString("es-CL");
   const operador = venta.operador || "Alguien";
-  const titulo = "POS \u2014 Nueva venta";
+  const titulo = `${NEGOCIO} \u2014 Nueva venta`;
   const cuerpo = `${operador} registr\u00f3 una venta por $${total}${metodo ? ` (${metodo})` : ""}`;
 
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);

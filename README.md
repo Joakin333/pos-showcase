@@ -76,7 +76,7 @@ que protege los datos está en la base:
 
 - **Sesiones reales.** El login se ve simple (eliges tu nombre y escribes tu
   clave), pero la clave la valida en el servidor la Edge Function
-  `iniciar-sesion`, con bloqueo tras 5 intentos. Si es correcta, entrega una
+  `iniciar-sesion`. Si es correcta, entrega una
   sesión de Supabase Auth cuyo token lleva el id de la persona en
   `app_metadata`, un campo que solo el servidor puede escribir.
 - **El rol lo decide la base.** En cada consulta, `fn_rol_actual()` busca el
@@ -91,7 +91,18 @@ que protege los datos está en la base:
   Cambiar una clave exige sesión. Para recuperar el acceso (pregunta secreta,
   código maestro o código por correo/SMS), la prueba viaja **junto** con la
   clave nueva y el servidor la vuelve a validar antes de guardarla.
-- **Límite de llamadas** en las funciones expuestas.
+- **Fuerza bruta.** Tras 5 intentos fallidos la cuenta se bloquea de forma
+  **progresiva** (1, 5, 15 y 30 minutos; un día sin fallos reinicia el
+  contador). Los intentos de una misma cuenta se procesan de a uno, así que
+  no se pueden probar claves en paralelo, y la Edge Function limita además los
+  intentos por IP. La clave mínima es de 6 caracteres.
+- **Recuperación de clave.** Cada código se envía **una sola vez** y pedir
+  códigos nuevos tiene un límite por cuenta (3 cada 15 minutos) además del
+  límite por IP.
+- **Primera configuración.** No hay cuentas por defecto: quien abre una
+  instalación nueva crea su propia cuenta de administradora.
+- **Límite de llamadas** en las funciones expuestas. La IP se toma del
+  encabezado que fija la infraestructura, no del que escribe el cliente.
 
 El detalle y las pruebas están en
 `supabase/migrations/20260101000009_autenticacion_real.sql`.
@@ -201,12 +212,12 @@ botella.
 ## Pruebas
 
 Cada push levanta un Supabase desde cero en GitHub Actions (Postgres, Auth,
-API REST y Edge Functions), aplica las 10 migraciones y corre tres capas de
+API REST y Edge Functions), aplica las migraciones y corre tres capas de
 pruebas (`.github/workflows/pruebas.yml`):
 
 | Capa | Qué prueba | Dónde |
 |---|---|---|
-| **Base de datos** (pgTAP, 40 pruebas) | Qué puede hacer cada rol (anónimo, vendedora, administradora), RLS, credenciales, y `registrar_venta`: idempotencia, FIFO entre lotes, validación, ventas offline, fiado y mermas. | `supabase/tests/database/` |
+| **Base de datos** (pgTAP) | Qué puede hacer cada rol (anónimo, vendedora, administradora), RLS, credenciales, y `registrar_venta`: idempotencia, FIFO entre lotes, validación, ventas offline, fiado y mermas. | `supabase/tests/database/` |
 | **Concurrencia real** | 20 conexiones compiten por la última unidad (debe aplicarse 1) y la misma venta llega 10 veces a la vez (debe aplicarse 1 y el resto volver como duplicadas). | `tests/concurrencia.sh` |
 | **Integración HTTP** | Igual que la app: login en la Edge Function, canje del token, JWT con el usuario en `app_metadata`, y ventas por la API con y sin sesión. | `tests/integracion.sh` |
 
@@ -242,6 +253,7 @@ En `supabase/migrations/`, en orden:
 | 008 | `notificaciones_push` | Aviso push a la administradora en cada venta. |
 | 009 | `autenticacion_real` | Sesiones de Supabase Auth, RLS por rol y credenciales protegidas. |
 | 010 | `registrar_venta` | Venta transaccional e idempotente, mermas con FIFO en el servidor. |
+| 011 | `endurecimiento_login` | Bloqueo progresivo, límite por IP y por cuenta, un envío por código de recuperación. |
 
 ### Funciones que usa la app
 
@@ -250,7 +262,7 @@ En `supabase/migrations/`, en orden:
 | Edge Function `iniciar-sesion` | Valida la clave (o la prueba de recuperación junto con la clave nueva) y entrega la sesión. |
 | `registrar_venta(venta, offline)` | Registra una venta completa en una transacción. Idempotente por id. |
 | `registrar_salida_stock(movimiento)` | Merma o ajuste de salida, con FIFO. Solo administradora. Idempotente por id. |
-| `verificar_credencial(usuario, tipo, valor)` | Valida una clave, respuesta secreta o código maestro, con bloqueo tras 5 intentos. |
+| `verificar_credencial(usuario, tipo, valor)` | Valida una clave, respuesta secreta o código maestro, con bloqueo progresivo tras 5 intentos fallidos. |
 | `guardar_credencial(usuario, tipo, valor)` | Cambia una clave o respuesta. La administradora puede cambiar cualquiera; el resto, solo la propia. |
 | `eliminar_credencial(usuario)` | Elimina las credenciales de una persona. Solo administradora. |
 | `rpc_registrar_contacto_recuperacion(usuario, canal, destino)` | Guarda el correo o teléfono de recuperación. La administradora, o la propia persona. |
@@ -296,9 +308,8 @@ supabase functions serve  # en otra terminal; después: tests/integracion.sh
 
 Luego cambia `SUPABASE_URL` y `SUPABASE_KEY` al inicio de `index.html` por
 los que muestra `supabase status`, y sirve el archivo con cualquier servidor
-estático (por ejemplo, `npx serve .`). La primera vez que abras la app se
-crean dos usuarios de prueba: **Admin** (clave `1234`) y **Operario** (clave
-`x`). Cámbialas al entrar.
+estático (por ejemplo, `npx serve .`). La primera vez que abras la app, una
+pantalla de primera configuración te pide crear la cuenta de administradora.
 
 ## Decisiones de diseño mobile-first
 

@@ -32,6 +32,17 @@ const responder = (cuerpo: unknown, status = 200) =>
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 
+// IP real del llamador: la fija la infraestructura (Cloudflare). El primer valor
+// de X-Forwarded-For lo puede escribir cualquiera, por eso se usa el último.
+function ipDe(req: Request): string {
+  const cf = req.headers.get("cf-connecting-ip") ?? req.headers.get("x-real-ip");
+  if (cf) return cf.trim();
+  const xff = (req.headers.get("x-forwarded-for") ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+  return xff.length ? xff[xff.length - 1] : "sin-ip";
+}
+const MAX_INTENTOS_POR_IP = 40;   // por ventana
+const VENTANA_IP_SEGUNDOS = 600;
+
 // uid() del cliente: base36 → solo minúsculas y dígitos.
 const ID_VALIDO = /^[a-z0-9]{4,40}$/;
 const METODOS = new Set(["respuesta", "maestro", "otp"]);
@@ -58,6 +69,16 @@ Deno.serve(async (req: Request) => {
   );
 
   try {
+    // 0) Límite por IP, además del bloqueo progresivo de cada cuenta: frena a
+    //    quien pruebe muchas cuentas distintas desde un mismo lugar.
+    const { data: permitido, error: eLimite } = await admin.rpc("fn_limite_clave", {
+      p_clave: `login-ip:${ipDe(req)}`, p_max: MAX_INTENTOS_POR_IP, p_ventana_segundos: VENTANA_IP_SEGUNDOS,
+    });
+    if (eLimite) throw eLimite;
+    if (!permitido) {
+      return responder({ ok: false, bloqueado: true, segundos: 120, mensaje: "Demasiados intentos desde esta conexión. Espera unos minutos." }, 429);
+    }
+
     // 1) La persona tiene que existir y estar activa en el negocio
     const { data: fila, error: eUsuarios } = await admin
       .from("app_data").select("value").eq("key", "usuarios").maybeSingle();

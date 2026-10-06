@@ -954,6 +954,9 @@ const saveUsuarios = () => saveKey('usuarios', true, usuarios.map(u=>{
    anteriores ('sha256' con sal fija y 'plano') se siguen aceptando al verificar, para no
    dejar a nadie fuera, y se convierten a PBKDF2 la próxima vez que esa persona entra. */
 const PBKDF2_ITER = 100000;
+/* Largo mínimo de una clave. El bloqueo progresivo del servidor limita los intentos, pero una
+   clave corta sigue siendo fácil de adivinar para quien la conozca de cerca. */
+const CLAVE_MIN = 6;
 function bytesAHex(buf){ return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join(''); }
 function hexABytes(hex){ const arr = new Uint8Array(hex.length/2); for(let i=0;i<arr.length;i++) arr[i] = parseInt(hex.substr(i*2,2),16); return arr; }
 async function derivarPBKDF2(txt, salHex, iter){
@@ -1139,20 +1142,6 @@ function inicialesDe(nombre){
   const partes = String(nombre||'?').trim().split(/\s+/);
   return ((partes[0]||'?')[0] + (partes[1]? partes[1][0] : '')).toUpperCase();
 }
-async function usuariosPorDefecto(){
-  // El perfil (nombre, rol) es público y sí sincroniza normalmente. La clave/respuesta
-  // de estos dos usuarios de fábrica se siembra aparte, en la tabla sellada, apenas haya
-  // conexión (ver sembrarCredencialesPorDefecto). Mientras tanto ambos quedan con
-  // credencial pendiente: no hay copia local, así que la primera entrada real de cada
-  // una va a pedir internet una vez, tal como cualquier primera entrada en un dispositivo.
-  return [
-    { id:uid(), nombre:'Admin', rol:'admin', tieneRespuesta:false,
-      pregunta:'¿Cómo se llama el negocio?', activo:true, creadoEn:Date.now(),
-      _semillaClave:'1234', _semillaRespuesta:normalizarRespuesta('manifiesto') },
-    { id:uid(), nombre:'Operario', rol:'vendedor', tieneRespuesta:false,
-      pregunta:'', activo:true, creadoEn:Date.now(), _semillaClave:'x' }
-  ];
-}
 /* Instalación nueva: perfiles y credenciales iniciales se siembran juntos con
    rpc_sembrar_inicial, que solo funciona mientras el negocio no tenga ningún usuario
    (sin sesión ya no se puede llamar a guardar_credencial). Devuelve true si quedó sembrado. */
@@ -1320,10 +1309,9 @@ async function initData(){
 
   usuarios = Array.isArray(us) ? us : [];
   if(!usuarios.length){
-    usuarios = await usuariosPorDefecto();
-    // sin conexión quedan solo en este dispositivo, con su marca de siembra: se siembran
-    // en el servidor (perfiles + credenciales juntos) en el próximo arranque con internet
-    if(!(await sembrarCredencialesPorDefecto(usuarios))) guardarEspejo('usuarios', usuarios, false);
+    // instalación nueva: no hay cuentas por defecto. La primera persona que abre la app crea
+    // la cuenta de administradora con su propia clave (ver renderLoginSetup).
+    loginPaso = 'setup';
   } else if(usuarios.some(u=>u._semillaClave || u._semillaRespuesta)){
     await sembrarCredencialesPorDefecto(usuarios);
   }
@@ -1546,11 +1534,53 @@ function volverAElegir(){
   renderLogin();
 }
 function renderLogin(){
+  if(loginPaso === 'setup') return renderLoginSetup();
   if(loginPaso === 'clave') return renderLoginClave();
   if(loginPaso === 'recuperar') return renderLoginRecuperar();
   if(loginPaso === 'validar-otp') return renderLoginValidarOTP();
   if(loginPaso === 'nueva-clave') return renderLoginNuevaClave();
   return renderLoginElegir();
+}
+
+/* --- primera configuración: se crea la cuenta de administradora --- */
+function renderLoginSetup(){
+  loginCard(`
+    <h3 style="margin:16px 0 4px;font-size:15px;">Primera configuración</h3>
+    <p style="font-size:12px;color:var(--ink-soft);margin:0 0 12px;">Crea la cuenta de administradora. Es la única que puede agregar personas y ver los reportes.</p>
+    <label class="field">Tu nombre</label>
+    <input class="input" id="su-nombre" autocomplete="off" placeholder="Así aparece en ventas y movimientos"/>
+    <label class="field">Clave (mínimo ${CLAVE_MIN} caracteres)</label>
+    <input class="input" id="su-1" type="password" autocomplete="new-password"/>
+    <label class="field">Repite la clave</label>
+    <input class="input" id="su-2" type="password" autocomplete="new-password"/>
+    <button class="btn btn-primary btn-block" id="su-crear" style="margin-top:16px;" type="button">Crear y entrar</button>
+  `);
+  $('#su-crear').addEventListener('click', async ()=>{
+    const nombre = $('#su-nombre').value.trim(), c1 = $('#su-1').value, c2 = $('#su-2').value;
+    if(!nombre){ loginError='Escribe tu nombre.'; renderLogin(); return; }
+    if(c1.length < CLAVE_MIN){ loginError='La clave debe tener al menos '+CLAVE_MIN+' caracteres.'; renderLogin(); return; }
+    if(c1 !== c2){ loginError='Las dos claves no coinciden.'; renderLogin(); return; }
+    if(!db || dbEstado!=='ok'){ loginError='Necesitas conexión a internet para la primera configuración.'; renderLogin(); return; }
+    const btn = $('#su-crear'); if(btn){ btn.disabled = true; btn.textContent = 'Creando...'; }
+    const bundle = await hashTexto(c1);
+    if(bundle.algo !== 'pbkdf2'){ loginError='Este navegador no puede proteger la clave (se necesita HTTPS).'; renderLogin(); return; }
+    const perfil = { id:uid(), nombre, rol:'admin', tieneRespuesta:false, pregunta:'', activo:true, creadoEn:Date.now() };
+    try{
+      const { data, error } = await db.rpc('rpc_sembrar_inicial', { p_usuarios:[perfil], p_credenciales:[{ usuario_id:perfil.id, tipo:'clave', bundle }] });
+      if(error || !data || !data.ok){
+        // ya existe una administradora (otra persona terminó la configuración antes): se muestra el login normal
+        if(data && data.motivo === 'ya_inicializado'){ loginPaso = 'elegir'; await initData(); return; }
+        loginError = 'No se pudo crear la cuenta: ' + ((data && data.mensaje) || describirError(error) || 'intenta de nuevo.');
+        renderLogin(); return;
+      }
+    }catch(e){ loginError='No se pudo contactar al servidor. Revisa tu conexión.'; renderLogin(); return; }
+    guardarCredencialLocal(perfil.id, bundle);
+    usuarios = [perfil]; guardarEspejo('usuarios', usuarios, false); snapshotDesde('usuarios', usuarios);
+    const r = await iniciarSesionNube(perfil.id, { clave:c1 });
+    if(!r.ok){ loginPaso='elegir'; loginError = 'Cuenta creada. Entra con tu clave.'; renderLogin(); return; }
+    loginPaso = 'elegir';
+    await entrarComo(perfil, true);
+  });
 }
 
 /* --- paso 1: ¿quién eres? --- */
@@ -1880,7 +1910,7 @@ function renderLoginNuevaClave(){
   if(!u || !recuperacionOk || !loginPruebaRecuperacion) return volverAElegir();
   loginCard(`
     <h3 style="margin:16px 0 4px;font-size:15px;">Nueva clave — ${escapeHtml(u.nombre)}</h3>
-    <p style="font-size:12px;color:var(--ink-soft);margin:0 0 10px;">Elige una clave de al menos 4 caracteres. Nadie más puede verla después.</p>
+    <p style="font-size:12px;color:var(--ink-soft);margin:0 0 10px;">Elige una clave de al menos ${CLAVE_MIN} caracteres. Nadie más puede verla después.</p>
     <label class="field">Clave nueva</label>
     <input class="input" id="nc-1" type="password" autocomplete="off"/>
     <label class="field">Repite la clave</label>
@@ -1893,7 +1923,7 @@ function renderLoginNuevaClave(){
   $('#nc-cancelar').addEventListener('click', volverAElegir);
   $('#nc-guardar').addEventListener('click', async ()=>{
     const c1 = $('#nc-1').value, c2 = $('#nc-2').value;
-    if(c1.length < 4){ loginError='La clave debe tener al menos 4 caracteres.'; renderLogin(); return; }
+    if(c1.length < CLAVE_MIN){ loginError='La clave debe tener al menos '+CLAVE_MIN+' caracteres.'; renderLogin(); return; }
     if(c1 !== c2){ loginError='Las dos claves no coinciden.'; renderLogin(); return; }
     const bundle = await hashTexto(c1);
     if(bundle.algo !== 'pbkdf2'){ loginError='Este navegador no puede proteger la clave (se necesita HTTPS).'; renderLogin(); return; }
@@ -2086,7 +2116,7 @@ function openUsuarioForm(u){
       <option value="admin" ${(!nuevo && u.rol==='admin')?'selected':''}>Admin — acceso total</option>
     </select>
     <label class="field">${nuevo?'Clave inicial':'Nueva clave (déjala vacía para no cambiarla)'}</label>
-    <input class="input" id="us-clave" type="text" autocomplete="off" placeholder="${nuevo?'Mínimo 1 carácter':'••••'}"/>
+    <input class="input" id="us-clave" type="text" autocomplete="off" placeholder="${nuevo?('Mínimo '+CLAVE_MIN+' caracteres'):'Déjala vacía para no cambiarla'}"/>
     <label class="field">Pregunta de seguridad (opcional)</label>
     <input class="input" id="us-pregunta" value="${nuevo?'':escapeHtml(u.pregunta||'')}" placeholder="Ej: ¿Cómo se llamaba tu primera mascota?"/>
     <label class="field">Respuesta ${nuevo?'':'(déjala vacía para no cambiarla)'}</label>
@@ -2116,6 +2146,7 @@ function openUsuarioForm(u){
     const activo = nuevo ? true : ($('#us-activo').value === 'si');
     if(!nombre){ showToast('El nombre no puede quedar vacío.', 'error'); return; }
     if(nuevo && !clave){ showToast('Define una clave inicial.', 'error'); return; }
+    if(clave && clave.length < CLAVE_MIN){ showToast('La clave debe tener al menos '+CLAVE_MIN+' caracteres.', 'error'); return; }
     if(!nuevo && u.rol==='admin' && (rol!=='admin' || !activo) && !hayOtroAdminActivo(u.id)){
       showToast('Debe quedar al menos una admin activa.', 'error'); return;
     }
@@ -2249,7 +2280,7 @@ function openMiCuentaModal(){
       claveOk = !!r.ok;
     }
     if(!claveOk){ showToast('La clave actual no es correcta.', 'error'); return; }
-    if(n1.length < 4){ showToast('La clave nueva debe tener al menos 4 caracteres.', 'error'); return; }
+    if(n1.length < CLAVE_MIN){ showToast('La clave nueva debe tener al menos '+CLAVE_MIN+' caracteres.', 'error'); return; }
     if(n1 !== n2){ showToast('Las dos claves nuevas no coinciden.', 'error'); return; }
     if(dbEstado!=='ok'){ showToast('Necesitas conexión a internet para guardar la clave nueva.', 'error'); return; }
     const bundle = await hashTexto(n1);
